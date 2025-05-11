@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/veverkap/gmail-to-sqlite/auth"
 	"github.com/veverkap/gmail-to-sqlite/db"

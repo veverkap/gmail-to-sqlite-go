@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"golang.org/x/text/encoding/charmap"
-	"golang.org/x/text/transform"
 )
 
 // Message represents an email message.
@@ -224,8 +222,8 @@ func (m *Message) Parse(msg map[string]interface{}, labels map[string]string) er
 					continue
 				}
 
-				if mimeType == "text/html" || mimeType == "text/plain" || 
-				   mimeType == "multipart/related" || mimeType == "multipart/alternative" {
+				if mimeType == "text/html" || mimeType == "text/plain" ||
+					mimeType == "multipart/related" || mimeType == "multipart/alternative" {
 					decodedBody := m.DecodeBody(partMap)
 					if decodedBody != "" {
 						m.Body = m.HTML2Text(decodedBody)

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"path/filepath"
 
@@ -32,7 +31,7 @@ func GetCredentials(dataDir string) (*oauth2.Token, error) {
 		return nil, fmt.Errorf("credentials.json not found")
 	}
 
-	b, err := ioutil.ReadFile(OAuth2CredentialsFile)
+	b, err := os.ReadFile(OAuth2CredentialsFile)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read client credentials file: %v", err)
 	}
