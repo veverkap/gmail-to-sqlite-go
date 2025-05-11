@@ -2,6 +2,7 @@ package sync
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -15,6 +16,10 @@ import (
 const (
 	// MaxResults is the maximum number of results to fetch per page.
 	MaxResults = 500
+	// MaxWorkers is the maximum number of concurrent workers processing messages.
+	// This limits the number of simultaneous requests to the Gmail API and
+	// concurrent database operations to prevent overwhelming resources.
+	MaxWorkers = 10
 )
 
 // GetLabels retrieves all labels from the Gmail API.
@@ -34,6 +39,13 @@ func GetLabels(service *gmail.Service) (map[string]string, error) {
 }
 
 // AllMessages fetches and saves all messages from the Gmail API.
+// It uses concurrent processing with goroutines to improve performance,
+// while limiting the number of concurrent operations to avoid overwhelming
+// the Gmail API with too many simultaneous requests.
+// 
+// The function fetches messages in pages, and processes each message in the page
+// concurrently using a worker pool limited by MaxWorkers. Database operations
+// are protected by a mutex to ensure thread safety.
 func AllMessages(token *oauth2.Token, database *db.DB, fullSync bool) (int, error) {
 	service, err := auth.GetService(token)
 	if err != nil {
@@ -67,6 +79,16 @@ func AllMessages(token *oauth2.Token, database *db.DB, fullSync bool) (int, erro
 	// Fetch messages
 	pageToken := ""
 	totalMessages := 0
+	
+	// Create a mutex to protect concurrent database access and console output
+	var mu sync.Mutex
+	
+	// Create a semaphore channel to limit concurrent goroutines
+	semaphore := make(chan struct{}, MaxWorkers)
+	
+	// Channel to collect errors from goroutines
+	errorsChan := make(chan error, MaxResults)
+
 	for {
 		req := service.Users.Messages.List("me").MaxResults(int64(MaxResults))
 		if pageToken != "" {
@@ -84,88 +106,82 @@ func AllMessages(token *oauth2.Token, database *db.DB, fullSync bool) (int, erro
 		messages := results.Messages
 		totalMessages += len(messages)
 
+		// Use a WaitGroup to wait for all goroutines to complete processing the current page
+		var wg sync.WaitGroup
+
 		for i, m := range messages {
-			// Check if the message already exists
-			rawMsg, err := service.Users.Messages.Get("me", m.Id).Do()
-			if err != nil {
-				fmt.Printf("Could not get message from Gmail %s: %v\n", m.Id, err)
-				continue
-			}
-
-			// Convert the Gmail message to a map for parsing
-			rawMsgMap := make(map[string]interface{})
-			rawMsgMap["id"] = rawMsg.Id
-			rawMsgMap["threadId"] = rawMsg.ThreadId
-			rawMsgMap["labelIds"] = rawMsg.LabelIds
-			rawMsgMap["sizeEstimate"] = float64(rawMsg.SizeEstimate)
-
-			// Extract payload
-			payload := make(map[string]interface{})
-			headers := make([]interface{}, 0)
-			for _, header := range rawMsg.Payload.Headers {
-				headers = append(headers, map[string]interface{}{
-					"name":  header.Name,
-					"value": header.Value,
-				})
-			}
-			payload["headers"] = headers
-
-			// Extract body
-			if rawMsg.Payload.Body != nil && rawMsg.Payload.Body.Data != "" {
-				payload["body"] = map[string]interface{}{
-					"data": rawMsg.Payload.Body.Data,
-				}
-			}
-
-			// Extract parts
-			if len(rawMsg.Payload.Parts) > 0 {
-				parts := make([]interface{}, 0)
-				for _, part := range rawMsg.Payload.Parts {
-					partMap := make(map[string]interface{})
-					partMap["mimeType"] = part.MimeType
-					if part.Body != nil && part.Body.Data != "" {
-						partMap["body"] = map[string]interface{}{
-							"data": part.Body.Data,
-						}
+			// Add to the wait group before starting the goroutine
+			wg.Add(1)
+			
+			// Acquire semaphore slot (blocks if MaxWorkers limit is reached)
+			semaphore <- struct{}{}
+			
+			// Start a goroutine to process the message
+			go func(idx int, messageID string) {
+				// Make sure we properly handle panics in goroutines
+				defer func() {
+					if r := recover(); r != nil {
+						mu.Lock()
+						fmt.Printf("Recovered from panic while processing message %s: %v\n", messageID, r)
+						mu.Unlock()
 					}
-					if len(part.Parts) > 0 {
-						subParts := make([]interface{}, 0)
-						for _, subPart := range part.Parts {
-							subPartMap := make(map[string]interface{})
-							subPartMap["mimeType"] = subPart.MimeType
-							if subPart.Body != nil && subPart.Body.Data != "" {
-								subPartMap["body"] = map[string]interface{}{
-									"data": subPart.Body.Data,
-								}
-							}
-							subParts = append(subParts, subPartMap)
-						}
-						partMap["parts"] = subParts
+				}()
+				
+				defer wg.Done()
+				defer func() { <-semaphore }() // Release semaphore slot when done
+
+				// Process the message
+				err := processMessage(service, database, messageID, labels, idx, &mu)
+				if err != nil {
+					mu.Lock()
+					fmt.Printf("Error processing message %s: %v\n", messageID, err)
+					mu.Unlock()
+					
+					// Send the error to the errors channel
+					select {
+					case errorsChan <- err:
+						// Error sent
+					default:
+						// Channel buffer is full, just log
+						mu.Lock()
+						fmt.Printf("Error buffer full, couldn't record error for %s\n", messageID)
+						mu.Unlock()
 					}
-					parts = append(parts, partMap)
 				}
-				payload["parts"] = parts
-			}
-			rawMsgMap["payload"] = payload
+			}(i, m.Id)
+		}
 
-			msg, err := message.FromRaw(rawMsgMap, labels)
-			if err != nil {
-				fmt.Printf("Could not process message %s: %v\n", m.Id, err)
-				continue
-			}
-
-			if err := database.CreateMessage(msg); err != nil {
-				fmt.Printf("Could not save message %s: %v\n", m.Id, err)
-				continue
-			}
-
-			fmt.Printf("Synced message %s from %v (Count: %d)\n", msg.ID, msg.Timestamp.Format(time.RFC3339), i+1)
+		// Wait for all messages in this page to be processed
+		wg.Wait()
+		
+		// Check if we've encountered too many errors and should abort
+		select {
+		case err := <-errorsChan:
+			// We have at least one error
+			mu.Lock()
+			fmt.Printf("Continuing despite error: %v\n", err)
+			mu.Unlock()
+		default:
+			// No errors, continue as normal
 		}
 
 		if results.NextPageToken == "" {
 			break
 		}
 		pageToken = results.NextPageToken
+	}
+
+	// Close the error channel
+	close(errorsChan)
+	
+	// Check for any errors that might need reporting
+	errCount := 0
+	for range errorsChan {
+		errCount++
+	}
+	
+	if errCount > 0 {
+		fmt.Printf("Completed with %d errors\n", errCount)
 	}
 
 	return totalMessages, nil
