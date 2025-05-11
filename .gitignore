@@ -1,6 +1,38 @@
-credentials.json
-*.db
-.venv
+# Python-specific items (kept for backward compatibility)
 __pycache__
+*.pyc
+*.pyo
+.venv
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+gmail-to-sqlite
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# OAuth2 credentials
+credentials.json
+
+# Database files
+*.db
+
+# IDE settings
+.idea/
 .vscode
+
+# Demo files
 demo.py
