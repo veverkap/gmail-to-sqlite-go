@@ -17,6 +17,8 @@ const (
 	// MaxResults is the maximum number of results to fetch per page.
 	MaxResults = 500
 	// MaxWorkers is the maximum number of concurrent workers processing messages.
+	// This limits the number of simultaneous requests to the Gmail API and
+	// concurrent database operations to prevent overwhelming resources.
 	MaxWorkers = 10
 )
 
@@ -37,6 +39,13 @@ func GetLabels(service *gmail.Service) (map[string]string, error) {
 }
 
 // AllMessages fetches and saves all messages from the Gmail API.
+// It uses concurrent processing with goroutines to improve performance,
+// while limiting the number of concurrent operations to avoid overwhelming
+// the Gmail API with too many simultaneous requests.
+// 
+// The function fetches messages in pages, and processes each message in the page
+// concurrently using a worker pool limited by MaxWorkers. Database operations
+// are protected by a mutex to ensure thread safety.
 func AllMessages(token *oauth2.Token, database *db.DB, fullSync bool) (int, error) {
 	service, err := auth.GetService(token)
 	if err != nil {
