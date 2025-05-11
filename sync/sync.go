@@ -2,6 +2,7 @@ package sync
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -15,6 +16,8 @@ import (
 const (
 	// MaxResults is the maximum number of results to fetch per page.
 	MaxResults = 500
+	// MaxWorkers is the maximum number of concurrent workers processing messages.
+	MaxWorkers = 10
 )
 
 // GetLabels retrieves all labels from the Gmail API.
@@ -67,6 +70,13 @@ func AllMessages(token *oauth2.Token, database *db.DB, fullSync bool) (int, erro
 	// Fetch messages
 	pageToken := ""
 	totalMessages := 0
+	
+	// Create a mutex to protect concurrent database access and console output
+	var mu sync.Mutex
+	
+	// Create a semaphore channel to limit concurrent goroutines
+	semaphore := make(chan struct{}, MaxWorkers)
+
 	for {
 		req := service.Users.Messages.List("me").MaxResults(int64(MaxResults))
 		if pageToken != "" {
@@ -84,83 +94,33 @@ func AllMessages(token *oauth2.Token, database *db.DB, fullSync bool) (int, erro
 		messages := results.Messages
 		totalMessages += len(messages)
 
+		// Use a WaitGroup to wait for all goroutines to complete processing the current page
+		var wg sync.WaitGroup
+
 		for i, m := range messages {
-			// Check if the message already exists
-			rawMsg, err := service.Users.Messages.Get("me", m.Id).Do()
-			if err != nil {
-				fmt.Printf("Could not get message from Gmail %s: %v\n", m.Id, err)
-				continue
-			}
+			// Add to the wait group before starting the goroutine
+			wg.Add(1)
+			
+			// Acquire semaphore slot (blocks if MaxWorkers limit is reached)
+			semaphore <- struct{}{}
+			
+			// Start a goroutine to process the message
+			go func(idx int, messageID string) {
+				defer wg.Done()
+				defer func() { <-semaphore }() // Release semaphore slot when done
 
-			// Convert the Gmail message to a map for parsing
-			rawMsgMap := make(map[string]interface{})
-			rawMsgMap["id"] = rawMsg.Id
-			rawMsgMap["threadId"] = rawMsg.ThreadId
-			rawMsgMap["labelIds"] = rawMsg.LabelIds
-			rawMsgMap["sizeEstimate"] = float64(rawMsg.SizeEstimate)
-
-			// Extract payload
-			payload := make(map[string]interface{})
-			headers := make([]interface{}, 0)
-			for _, header := range rawMsg.Payload.Headers {
-				headers = append(headers, map[string]interface{}{
-					"name":  header.Name,
-					"value": header.Value,
-				})
-			}
-			payload["headers"] = headers
-
-			// Extract body
-			if rawMsg.Payload.Body != nil && rawMsg.Payload.Body.Data != "" {
-				payload["body"] = map[string]interface{}{
-					"data": rawMsg.Payload.Body.Data,
+				// Process the message
+				err := processMessage(service, database, messageID, labels, idx, &mu)
+				if err != nil {
+					mu.Lock()
+					fmt.Printf("Error processing message %s: %v\n", messageID, err)
+					mu.Unlock()
 				}
-			}
-
-			// Extract parts
-			if len(rawMsg.Payload.Parts) > 0 {
-				parts := make([]interface{}, 0)
-				for _, part := range rawMsg.Payload.Parts {
-					partMap := make(map[string]interface{})
-					partMap["mimeType"] = part.MimeType
-					if part.Body != nil && part.Body.Data != "" {
-						partMap["body"] = map[string]interface{}{
-							"data": part.Body.Data,
-						}
-					}
-					if len(part.Parts) > 0 {
-						subParts := make([]interface{}, 0)
-						for _, subPart := range part.Parts {
-							subPartMap := make(map[string]interface{})
-							subPartMap["mimeType"] = subPart.MimeType
-							if subPart.Body != nil && subPart.Body.Data != "" {
-								subPartMap["body"] = map[string]interface{}{
-									"data": subPart.Body.Data,
-								}
-							}
-							subParts = append(subParts, subPartMap)
-						}
-						partMap["parts"] = subParts
-					}
-					parts = append(parts, partMap)
-				}
-				payload["parts"] = parts
-			}
-			rawMsgMap["payload"] = payload
-
-			msg, err := message.FromRaw(rawMsgMap, labels)
-			if err != nil {
-				fmt.Printf("Could not process message %s: %v\n", m.Id, err)
-				continue
-			}
-
-			if err := database.CreateMessage(msg); err != nil {
-				fmt.Printf("Could not save message %s: %v\n", m.Id, err)
-				continue
-			}
-
-			fmt.Printf("Synced message %s from %v (Count: %d)\n", msg.ID, msg.Timestamp.Format(time.RFC3339), i+1)
+			}(i, m.Id)
 		}
+
+		// Wait for all messages in this page to be processed
+		wg.Wait()
 
 		if results.NextPageToken == "" {
 			break
