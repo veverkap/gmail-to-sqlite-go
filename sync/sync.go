@@ -76,6 +76,9 @@ func AllMessages(token *oauth2.Token, database *db.DB, fullSync bool) (int, erro
 	
 	// Create a semaphore channel to limit concurrent goroutines
 	semaphore := make(chan struct{}, MaxWorkers)
+	
+	// Channel to collect errors from goroutines
+	errorsChan := make(chan error, MaxResults)
 
 	for {
 		req := service.Users.Messages.List("me").MaxResults(int64(MaxResults))
@@ -106,6 +109,15 @@ func AllMessages(token *oauth2.Token, database *db.DB, fullSync bool) (int, erro
 			
 			// Start a goroutine to process the message
 			go func(idx int, messageID string) {
+				// Make sure we properly handle panics in goroutines
+				defer func() {
+					if r := recover(); r != nil {
+						mu.Lock()
+						fmt.Printf("Recovered from panic while processing message %s: %v\n", messageID, r)
+						mu.Unlock()
+					}
+				}()
+				
 				defer wg.Done()
 				defer func() { <-semaphore }() // Release semaphore slot when done
 
@@ -115,17 +127,52 @@ func AllMessages(token *oauth2.Token, database *db.DB, fullSync bool) (int, erro
 					mu.Lock()
 					fmt.Printf("Error processing message %s: %v\n", messageID, err)
 					mu.Unlock()
+					
+					// Send the error to the errors channel
+					select {
+					case errorsChan <- err:
+						// Error sent
+					default:
+						// Channel buffer is full, just log
+						mu.Lock()
+						fmt.Printf("Error buffer full, couldn't record error for %s\n", messageID)
+						mu.Unlock()
+					}
 				}
 			}(i, m.Id)
 		}
 
 		// Wait for all messages in this page to be processed
 		wg.Wait()
+		
+		// Check if we've encountered too many errors and should abort
+		select {
+		case err := <-errorsChan:
+			// We have at least one error
+			mu.Lock()
+			fmt.Printf("Continuing despite error: %v\n", err)
+			mu.Unlock()
+		default:
+			// No errors, continue as normal
+		}
 
 		if results.NextPageToken == "" {
 			break
 		}
 		pageToken = results.NextPageToken
+	}
+
+	// Close the error channel
+	close(errorsChan)
+	
+	// Check for any errors that might need reporting
+	errCount := 0
+	for range errorsChan {
+		errCount++
+	}
+	
+	if errCount > 0 {
+		fmt.Printf("Completed with %d errors\n", errCount)
 	}
 
 	return totalMessages, nil
